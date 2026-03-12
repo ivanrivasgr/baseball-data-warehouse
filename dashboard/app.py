@@ -16,11 +16,132 @@ st.set_page_config(
 DB_PATH    = "data/warehouse.duckdb"
 BRONZE_DIR = "data/bronze"
 
+def build_warehouse():
+    import pybaseball as pb
+    pb.cache.enable()
+
+    st.info("Downloading MLB data... this takes 3-5 minutes on first load.")
+
+    progress = st.progress(0, text="Ingesting batting stats...")
+    frames = []
+    for i, year in enumerate([2022, 2023, 2024]):
+        df = pb.batting_stats(year, qual=50)
+        df["season"] = year
+        frames.append(df)
+        progress.progress((i+1)/12, text=f"Batting {year} done...")
+    batting = pd.concat(frames, ignore_index=True)
+
+    frames = []
+    for i, year in enumerate([2022, 2023, 2024]):
+        df = pb.pitching_stats(year, qual=30)
+        df["season"] = year
+        frames.append(df)
+        progress.progress(3/12 + (i+1)/12, text=f"Pitching {year} done...")
+    pitching = pd.concat(frames, ignore_index=True)
+
+    progress.progress(7/12, text="Ingesting Statcast 2024 (largest dataset)...")
+    statcast = pb.statcast(start_dt="2024-04-01", end_dt="2024-10-01")
+    statcast = statcast[statcast["events"].notna() & statcast["launch_speed"].notna()]
+    cols = ["game_date","batter","pitcher","player_name","pitch_type",
+            "release_speed","release_spin_rate","launch_speed","launch_angle",
+            "hit_distance_sc","events","description","bb_type",
+            "estimated_ba_using_speedangle","estimated_woba_using_speedangle",
+            "home_team","away_team","inning"]
+    statcast = statcast[[c for c in cols if c in statcast.columns]]
+    statcast["season"] = 2024
+
+    progress.progress(9/12, text="Building warehouse...")
+    conn = duckdb.connect(DB_PATH)
+
+    conn.execute("""
+        CREATE OR REPLACE TABLE gold_player_season AS
+        SELECT
+            CAST("IDfg" AS VARCHAR) AS player_id,
+            "Name" AS player_name, "Team" AS team,
+            CAST("season" AS INTEGER) AS season,
+            CAST("G" AS INTEGER) AS games,
+            CAST("PA" AS INTEGER) AS plate_appearances,
+            CAST("HR" AS INTEGER) AS home_runs,
+            CAST("RBI" AS INTEGER) AS rbi,
+            CAST("SB" AS INTEGER) AS stolen_bases,
+            ROUND(CAST("AVG" AS DOUBLE), 3) AS avg,
+            ROUND(CAST("OBP" AS DOUBLE), 3) AS obp,
+            ROUND(CAST("SLG" AS DOUBLE), 3) AS slg,
+            ROUND(CAST("OPS" AS DOUBLE), 3) AS ops,
+            ROUND(CAST("wOBA" AS DOUBLE), 3) AS woba,
+            ROUND(CAST("WAR" AS DOUBLE), 2) AS war,
+            RANK() OVER (PARTITION BY CAST("season" AS INTEGER) ORDER BY CAST("WAR" AS DOUBLE) DESC) AS war_rank
+        FROM batting
+        WHERE CAST("PA" AS INTEGER) >= 50
+    """)
+
+    conn.execute("""
+        CREATE OR REPLACE TABLE gold_pitcher_performance AS
+        SELECT
+            CAST("IDfg" AS VARCHAR) AS player_id,
+            "Name" AS player_name, "Team" AS team,
+            CAST("season" AS INTEGER) AS season,
+            CAST("G" AS INTEGER) AS games,
+            CAST("GS" AS INTEGER) AS games_started,
+            ROUND(CAST("IP" AS DOUBLE), 1) AS innings_pitched,
+            CAST("W" AS INTEGER) AS wins,
+            CAST("L" AS INTEGER) AS losses,
+            CAST("SO" AS INTEGER) AS strikeouts,
+            ROUND(CAST("ERA" AS DOUBLE), 2) AS era,
+            ROUND(CAST("WHIP" AS DOUBLE), 2) AS whip,
+            ROUND(CAST("FIP" AS DOUBLE), 2) AS fip,
+            ROUND(CAST("xFIP" AS DOUBLE), 2) AS xfip,
+            ROUND(CAST("K/9" AS DOUBLE), 2) AS k_per_9,
+            ROUND(CAST("BB/9" AS DOUBLE), 2) AS bb_per_9,
+            ROUND(CAST("WAR" AS DOUBLE), 2) AS war,
+            RANK() OVER (PARTITION BY CAST("season" AS INTEGER) ORDER BY CAST("WAR" AS DOUBLE) DESC) AS war_rank
+        FROM pitching
+        WHERE CAST("IP" AS DOUBLE) >= 20
+    """)
+
+    conn.execute("""
+        CREATE OR REPLACE TABLE gold_statcast_contact AS
+        SELECT
+            CAST(batter AS VARCHAR) AS batter_id,
+            FIRST(player_name) AS batter_name,
+            COUNT(*) AS batted_balls,
+            ROUND(AVG(CAST(launch_speed AS DOUBLE)), 1) AS avg_exit_velo,
+            ROUND(AVG(CAST(launch_angle AS DOUBLE)), 1) AS avg_launch_angle,
+            ROUND(AVG(CAST(estimated_ba_using_speedangle AS DOUBLE)), 3) AS avg_xba,
+            ROUND(AVG(CAST(estimated_woba_using_speedangle AS DOUBLE)), 3) AS avg_xwoba,
+            ROUND(100.0 * SUM(CASE WHEN CAST(launch_speed AS DOUBLE) >= 95 THEN 1 ELSE 0 END) / COUNT(*), 1) AS hard_hit_pct,
+            ROUND(100.0 * SUM(CASE WHEN CAST(launch_speed AS DOUBLE) >= 98 AND CAST(launch_angle AS DOUBLE) BETWEEN 26 AND 30 THEN 1 ELSE 0 END) / COUNT(*), 1) AS barrel_pct
+        FROM statcast
+        GROUP BY CAST(batter AS VARCHAR)
+        HAVING COUNT(*) >= 20
+    """)
+
+    conn.execute("""
+        CREATE OR REPLACE TABLE gold_team_offense AS
+        SELECT
+            team, season,
+            COUNT(DISTINCT player_id) AS players,
+            ROUND(AVG(avg), 3) AS team_avg,
+            ROUND(AVG(ops), 3) AS team_ops,
+            ROUND(AVG(woba), 3) AS team_woba,
+            SUM(home_runs) AS total_hr,
+            SUM(rbi) AS total_rbi,
+            ROUND(SUM(war), 1) AS total_war,
+            RANK() OVER (PARTITION BY season ORDER BY SUM(war) DESC) AS war_rank
+        FROM gold_player_season
+        GROUP BY team, season
+    """)
+
+    conn.close()
+    progress.progress(1.0, text="Warehouse ready!")
+    st.success("Data loaded successfully!")
+    st.rerun()
+
 @st.cache_resource
 def get_conn():
+    os.makedirs("data", exist_ok=True)
     if not os.path.exists(DB_PATH):
-        st.error("Warehouse not found. Run: python ingestion/transform.py")
-        st.stop()
+        build_warehouse()
     return duckdb.connect(DB_PATH, read_only=True)
 
 @st.cache_data
