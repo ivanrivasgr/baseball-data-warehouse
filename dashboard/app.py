@@ -13,7 +13,7 @@ st.set_page_config(
 
 # ── DATA PATHS ────────────────────────────────────────────────────────────────
 BASE_DIR  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-GOLD_DIR  = os.path.join(BASE_DIR, "data", "gold")
+GOLD_DIR  = os.path.join(BASE_DIR, "gold_data")
 
 BATTING_PATH  = os.path.join(GOLD_DIR, "batting.parquet")
 PITCHING_PATH = os.path.join(GOLD_DIR, "pitching.parquet")
