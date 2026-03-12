@@ -134,7 +134,9 @@ def build_warehouse():
 
     conn.close()
     progress.progress(1.0, text="Warehouse ready!")
-    st.success("Data loaded successfully!")
+    st.success("✅ Data loaded! Please wait...")
+    import time
+    time.sleep(2)
     st.rerun()
 
 @st.cache_resource
@@ -142,6 +144,7 @@ def get_conn():
     os.makedirs("data", exist_ok=True)
     if not os.path.exists(DB_PATH):
         build_warehouse()
+        st.stop()
     return duckdb.connect(DB_PATH, read_only=True)
 
 @st.cache_data
