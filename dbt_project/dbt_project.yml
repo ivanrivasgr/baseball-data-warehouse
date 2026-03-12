@@ -1,0 +1,17 @@
+name: baseball_warehouse
+version: "1.0.0"
+config-version: 2
+
+profile: baseball_warehouse
+
+model-paths: ["models"]
+test-paths: ["tests"]
+target-path: "target"
+clean-targets: ["target"]
+
+models:
+  baseball_warehouse:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
